@@ -8,7 +8,9 @@
 
 import os
 import sys
+import re
 import math
+import json
 import random
 import shutil
 import threading
@@ -49,6 +51,23 @@ RES_DIR = _res_dir()
 BASE_DIR = APP_DIR
 FONT_DIR = APP_DIR / "fonts"           # 可写：用户可自行放入字体
 BUILTIN_FONT_DIR = RES_DIR / "fonts"   # 内置字体（随 exe 打包，只读）
+CONFIG_PATH = Path.home() / ".signature_tool.json"
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        old = load_config()
+        old.update(cfg)
+        CONFIG_PATH.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------- 字体管理
 
@@ -239,6 +258,20 @@ def render_signature(name, font_path, width=300, height=120, seed=0,
 # ---------------------------------------------------------------- Excel 处理
 
 NAME_COL_KEYWORDS = ["姓名", "名字", "学生", "员工", "人员", "成员", "name"]
+INDEX_COL_KEYWORDS = ["序号", "编号", "序", "no", "index"]
+
+
+def guess_index_col(header):
+    """猜测序号列，返回列索引或 None"""
+    for idx, cell in enumerate(header):
+        c = (cell or "").strip().lower()
+        if not c:
+            continue
+        if c in ("序号", "编号", "no", "no.", "index"):
+            return idx
+        if any(k == c for k in INDEX_COL_KEYWORDS):
+            return idx
+    return None
 
 
 def read_excel_sheets(path):
@@ -317,6 +350,133 @@ def safe_name(s):
         s = s.replace(ch, "_")
     return s.strip() or "unnamed"
 
+
+def _tr_height_cm(row):
+    """读取表格行的固定行高（cm），无设置返回 None"""
+    from docx.oxml.ns import qn
+    tr = row._tr
+    trPr = tr.trPr
+    if trPr is None:
+        return None
+    el = trPr.find(qn("w:trHeight"))
+    if el is None:
+        return None
+    val = el.get(qn("w:val"))
+    return int(val) / 567.0 if val else None  # 567 twips = 1cm
+
+
+def export_word(template_path, entries, out_path, height_cm=0.8):
+    """
+    把签名图片插入 Word 模板表格中「序号」对应的行。
+    entries: [(序号:int, 姓名:str, png:Path)]
+    返回 (已插入数量, 未匹配到的序号列表)
+    """
+    try:
+        from docx import Document
+        from docx.shared import Cm, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_ALIGN_VERTICAL
+    except ImportError:
+        raise RuntimeError("缺少 python-docx，请先执行: pip install python-docx")
+
+    doc = Document(template_path)
+    by_idx = {idx: png for idx, _n, png in entries if png.exists()}
+    inserted_tcs = set()
+    used_idx = set()
+    inserted = 0
+
+    for table in doc.tables:
+        n_rows = len(table.rows)
+        if n_rows < 2:
+            continue
+        # 定位表头（前 3 行内找"序号"）
+        head_ri = None
+        for ri in range(min(3, n_rows)):
+            texts = [c.text.strip() for c in table.rows[ri].cells]
+            if any("序号" in t for t in texts):
+                head_ri = ri
+                break
+        if head_ri is None:
+            continue
+
+        header = [c.text.strip() for c in table.rows[head_ri].cells]
+        sig_keys = ("签到", "签名", "签收", "签字")
+        idx_cols = [i for i, t in enumerate(header) if "序号" in t]
+        sig_cols = [i for i, t in enumerate(header) if any(k in t for k in sig_keys)]
+        if not idx_cols or not sig_cols:
+            continue
+        # 每组的「序号」列配它右侧最近的「签到」列
+        pairs = []
+        for c in idx_cols:
+            right = [s for s in sig_cols if s > c]
+            if right:
+                pairs.append((c, min(right)))
+        if not pairs:
+            continue
+
+        # 列宽（cm）用于限制签名宽度
+        col_w = {}
+        for _c, s in pairs:
+            w = None
+            try:
+                w = table.columns[s].width
+            except Exception:
+                w = None
+            if w is None:
+                w = table.rows[head_ri].cells[s].width
+            col_w[s] = (w.cm if w else 3.0)
+
+        for ri in range(head_ri + 1, n_rows):
+            row = table.rows[ri]
+            row_h = _tr_height_cm(row)
+            for idx_col, sig_col in pairs:
+                m = re.search(r"\d+", row.cells[idx_col].text.strip())
+                if not m:
+                    continue
+                png = by_idx.get(int(m.group()))
+                if png is None:
+                    continue
+                cell = row.cells[sig_col]
+                if cell._tc in inserted_tcs:
+                    continue
+                inserted_tcs.add(cell._tc)
+
+                # 清空单元格原有内容，只留一个空段落
+                for p in cell.paragraphs[1:]:
+                    p._element.getparent().remove(p._element)
+                p = cell.paragraphs[0]
+                for r in list(p.runs):
+                    r._element.getparent().remove(r._element)
+
+                # 尺寸：受行高与列宽双重限制，避免被 exact 行高裁切
+                h = height_cm
+                if row_h:
+                    h = min(h, max(0.3, row_h - 0.08))
+                max_w = max(0.8, col_w[sig_col] * 0.93)
+                with Image.open(png) as im:
+                    pw, ph = im.size
+                w = h * pw / ph
+                if w > max_w:
+                    w = max_w
+                    h = w * ph / pw
+
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                pf = p.paragraph_format
+                pf.space_before = Pt(0)
+                pf.space_after = Pt(0)
+                pf.line_spacing = 1.0
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                p.add_run().add_picture(str(png), width=Cm(w), height=Cm(h))
+                inserted += 1
+                used_idx.add(int(m.group()))
+
+    if inserted == 0:
+        raise RuntimeError("模板中未找到可插入的「序号 / 签到」表格列，或名单序号与模板不匹配")
+
+    doc.save(out_path)
+    unmatched = sorted(i for i in by_idx if i not in used_idx)
+    return inserted, unmatched
+
 # ---------------------------------------------------------------- GUI
 
 SAMPLE_COLS = 4
@@ -332,8 +492,11 @@ class App:
         self.fonts = scan_fonts()
         self.font_vars = {}
         self.xlsx_path = tk.StringVar()
+        self.word_tpl = tk.StringVar()
+        self.word_h = tk.DoubleVar(value=0.8)
         self.sheet_var = tk.StringVar()
         self.name_col_var = tk.StringVar()
+        self.index_col_var = tk.StringVar(value="（按名单顺序）")
         self.width_var = tk.IntVar(value=300)
         self.height_var = tk.IntVar(value=120)
         self.ink_var = tk.StringVar(value="随机")
@@ -345,6 +508,7 @@ class App:
         self.status_var = tk.StringVar(value="就绪。先选择包含姓名的 Excel 文件。")
         self.seed = random.randrange(1 << 30)
         self.names = []
+        self.entries = []   # [(序号, 姓名)]
         self.rows_data = []
         self.preview_refs = []
         self.result_q = queue.Queue()
@@ -352,6 +516,23 @@ class App:
 
         self._build_ui()
         self._poll_queue()
+
+        # 恢复上次使用的模板路径
+        cfg = load_config()
+        if cfg.get("word_tpl") and Path(cfg["word_tpl"]).exists():
+            self.word_tpl.set(cfg["word_tpl"])
+        if cfg.get("xlsx_path") and Path(cfg["xlsx_path"]).exists():
+            self.root.after(200, lambda p=cfg["xlsx_path"]: self._auto_open(p))
+
+    def _auto_open(self, path):
+        try:
+            self.rows_data = read_excel_sheets(path)
+            self.xlsx_path.set(path)
+            self.sheet_cb["values"] = list(self.rows_data.keys())
+            self.sheet_var.set(list(self.rows_data.keys())[0])
+            self.on_sheet_change()
+        except Exception:
+            pass
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -374,6 +555,21 @@ class App:
         self.name_cb = ttk.Combobox(row2, textvariable=self.name_col_var,
                                     state="readonly", width=14)
         self.name_cb.pack(side="left", padx=4)
+
+        row3 = ttk.Frame(self.root)
+        row3.pack(fill="x", **pad)
+        ttk.Label(row3, text="序号列:").pack(side="left")
+        self.index_cb = ttk.Combobox(row3, textvariable=self.index_col_var,
+                                     state="readonly", width=14)
+        self.index_cb.pack(side="left", padx=4)
+        self.index_cb.bind("<<ComboboxSelected>>", lambda e: self.load_names())
+        ttk.Button(row3, text="Word 模板", command=self.pick_word_tpl).pack(side="left", padx=(14, 4))
+        ttk.Label(row3, textvariable=self.word_tpl, foreground="#555").pack(
+            side="left", fill="x", expand=True)
+        ttk.Label(row3, text="签名高:").pack(side="left")
+        ttk.Spinbox(row3, from_=0.4, to=1.2, increment=0.1, textvariable=self.word_h,
+                    width=5).pack(side="left", padx=2)
+        ttk.Label(row3, text="cm").pack(side="left")
 
         params = ttk.LabelFrame(self.root, text="生成参数")
         params.pack(fill="x", **pad)
@@ -422,6 +618,8 @@ class App:
         self.btn_xlsx.pack(side="left", padx=6)
         self.btn_imgs = ttk.Button(btns, text="仅导出图片文件夹", command=self.export_images)
         self.btn_imgs.pack(side="left")
+        self.btn_word = ttk.Button(btns, text="导出 Word（套模板）", command=self.export_word_doc)
+        self.btn_word.pack(side="left", padx=6)
         self.progress = ttk.Progressbar(btns, length=200, mode="determinate")
         self.progress.pack(side="right", padx=6)
 
@@ -454,19 +652,33 @@ class App:
             messagebox.showerror("读取失败", f"无法读取该文件：\n{e}\n\n仅支持 .xlsx 格式。")
             return
         self.xlsx_path.set(p)
+        save_config({"xlsx_path": p})
         self.sheet_cb["values"] = list(self.rows_data.keys())
         self.sheet_var.set(list(self.rows_data.keys())[0])
         self.on_sheet_change()
+
+    def pick_word_tpl(self):
+        p = filedialog.askopenfilename(title="选择 Word 模板",
+                                       filetypes=[("Word", "*.docx"), ("所有文件", "*.*")])
+        if not p:
+            return
+        self.word_tpl.set(p)
+        save_config({"word_tpl": p})
+        self.status_var.set(f"Word 模板: {Path(p).name}")
 
     def on_sheet_change(self):
         rows = self.rows_data.get(self.sheet_var.get(), [])
         if not rows:
             return
         header = rows[0] if self.header_var.get() else ["列%d" % (i + 1) for i in range(len(rows[0] or []))]
-        self.name_cb["values"] = [f"{i + 1}. {h}" for i, h in enumerate(header)]
+        opts = [f"{i + 1}. {h}" for i, h in enumerate(header)]
+        self.name_cb["values"] = opts
+        self.index_cb["values"] = ["（按名单顺序）"] + opts
         guess = guess_name_col(header)
         if guess is not None:
             self.name_col_var.set(f"{guess + 1}. {header[guess]}")
+        idx_guess = guess_index_col(header)
+        self.index_col_var.set(opts[idx_guess] if idx_guess is not None else "（按名单顺序）")
         self.load_names()
 
     def load_names(self):
@@ -477,14 +689,33 @@ class App:
             col_idx = int(self.name_col_var.get().split(".")[0]) - 1
         except (ValueError, IndexError):
             self.names = []
+            self.entries = []
             return
+        # 序号列（用于 Word 模板按序号落位）
+        idx_col = None
+        if self.index_col_var.get() and not self.index_col_var.get().startswith("（"):
+            try:
+                idx_col = int(self.index_col_var.get().split(".")[0]) - 1
+            except (ValueError, IndexError):
+                idx_col = None
+
         start = 1 if self.header_var.get() else 0
-        names = []
+        entries = []
+        seq = 0
         for r in rows[start:]:
             if col_idx < len(r) and r[col_idx].strip():
-                names.append(r[col_idx].strip())
-        self.names = names
-        self.status_var.set(f"已加载 {len(names)} 个姓名（工作表: {self.sheet_var.get()}）")
+                seq += 1
+                num = None
+                if idx_col is not None and idx_col < len(r):
+                    m = re.search(r"\d+", r[idx_col])
+                    if m:
+                        num = int(m.group())
+                entries.append((num if num is not None else seq, r[col_idx].strip()))
+        self.entries = entries
+        self.names = [n for _i, n in entries]
+        self.status_var.set(
+            f"已加载 {len(self.names)} 个姓名（工作表: {self.sheet_var.get()}，"
+            f"序号 {entries[0][0]}~{entries[-1][0]}）" if entries else "未读到姓名")
 
     # ---------- 渲染 ----------
     def pick_font(self, rng):
@@ -553,6 +784,9 @@ class App:
         if not self.names:
             messagebox.showwarning("提示", "没有读到任何姓名，请检查工作表 / 姓名列 / 首行表头设置")
             return
+        if mode == "word" and not self.word_tpl.get():
+            messagebox.showwarning("提示", "请先选择 Word 模板（签到表等表格需含「序号」「签到」两列）")
+            return
         out_dir = filedialog.askdirectory(title="选择输出目录")
         if not out_dir:
             return
@@ -564,21 +798,34 @@ class App:
 
     def _export_worker(self, mode, out_dir):
         try:
-            total = len(self.names)
+            total = len(self.entries)
             sig_dir = out_dir / f"签名图片_{safe_name(self.sheet_var.get())}"
             sig_dir.mkdir(parents=True, exist_ok=True)
-            for i, name in enumerate(self.names):
+            triples = []
+            for i, (idx, name) in enumerate(self.entries):
                 im = self.gen_one(name)
-                im.save(sig_dir / f"{i + 1:04d}_{safe_name(name)}.png")
+                png = sig_dir / f"{i + 1:04d}_{safe_name(name)}.png"
+                im.save(png)
+                triples.append((idx, name, png))
                 self.result_q.put(("progress", (i + 1) * 70 // total))
             if mode == "xlsx":
-                stamp = ""
                 tpl = self.xlsx_path.get()
                 out_xlsx = out_dir / (Path(tpl).stem + "_含签名.xlsx")
                 export_excel(tpl, self.sheet_var.get(), self.names, sig_dir,
                              out_xlsx, width=self.width_var.get(),
                              height=self.height_var.get())
                 self.result_q.put(("done", f"完成！\n签名图片: {sig_dir}\nExcel: {out_xlsx}\n\n注意：输出 Excel 由模板数据重建，原文件中的图片/图表不会保留。"))
+            elif mode == "word":
+                tpl = self.word_tpl.get()
+                out_docx = out_dir / (Path(tpl).stem + "_已签名.docx")
+                n, unmatched = export_word(tpl, triples, out_docx,
+                                           height_cm=float(self.word_h.get()))
+                self.result_q.put(("progress", 100))
+                extra = ""
+                if unmatched:
+                    showed = ", ".join(str(i) for i in unmatched[:15])
+                    extra = f"\n\n有 {len(unmatched)} 个序号在模板中找不到空位: {showed}"
+                self.result_q.put(("done", f"完成！已把 {n} 个签名填入模板\nWord: {out_docx}{extra}"))
             else:
                 self.result_q.put(("done", f"完成！共 {total} 张签名图片\n目录: {sig_dir}"))
         except Exception as e:
@@ -590,9 +837,12 @@ class App:
     def export_images(self):
         self._do_export("images")
 
+    def export_word_doc(self):
+        self._do_export("word")
+
     def _set_buttons(self, enabled):
         state = "normal" if enabled else "disabled"
-        for b in (self.btn_preview, self.btn_xlsx, self.btn_imgs):
+        for b in (self.btn_preview, self.btn_xlsx, self.btn_imgs, self.btn_word):
             b.configure(state=state)
 
     def _poll_queue(self):
