@@ -3,7 +3,10 @@
 
 #define MyAppName "签名小工具"
 #define MyAppNameEn "SignatureTool"
+; 版本号可由 CI 传入: ISCC.exe /DMyAppVersion=x.y.z installer.iss
+#ifndef MyAppVersion
 #define MyAppVersion "1.0.0"
+#endif
 #define MyAppExeName "SignatureTool.exe"
 #define MyAppPublisher "qq137504949"
 

@@ -52,7 +52,8 @@ jobs:
             choco install innosetup -y --no-progress
             $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           }
-          & $iscc installer.iss
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          & $iscc "/DMyAppVersion=$ver" installer.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 
       - name: Upload artifacts
