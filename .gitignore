@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+installer_output/
+*.spec.bak
+.DS_Store
+Thumbs.db
+
+# 工具运行产物
+签名图片_*/
+*_含签名.xlsx
+*.log
+
+# 虚拟环境
+venv/
+.venv/
+env/

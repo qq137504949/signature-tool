@@ -1,0 +1,6 @@
+# 运行时依赖（Windows 打包所需）
+pillow>=10.0
+openpyxl>=3.1
+
+# 打包依赖（GitHub Actions 中单独安装；本地打包执行: pip install pyinstaller）
+# pyinstaller>=6.0
